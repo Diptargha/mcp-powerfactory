@@ -1,0 +1,58 @@
+DIgSILENT PowerFactory MCP Functions Overview
+=============================================
+
+This project exposes DIgSILENT PowerFactory simulation capabilities through an MCP server and a simulation agent.
+
+Main entry points
+-----------------
+- MCP_PowerFactory.py: MCP server entry point.
+- Agent_DIgSILENT.py: PowerFactory simulation engine.
+- simulation_config.json: active runtime configuration.
+- simulation_config.example.json: example configuration for new users.
+
+Implemented MCP tools
+---------------------
+- ping: connectivity check that returns pong.
+- close_digsilent: closes the PowerFactory session.
+- get_config: returns the active configuration file.
+- import_project: imports a .pfd project and activates it.
+- create_study_case: creates or activates a study case with optional idempotency support.
+- modify_parameter: updates one PowerFactory attribute across matching objects.
+- run_loadflow: runs ComLdf on the active study case.
+- run_short_circuit: runs ComShc on the active study case.
+- run_simulation: executes the configured load flow, RMS simulation, CSV export, plotting, and optional PFD export pipeline.
+- run_custom_case: runs one fault scenario supplied at call time.
+- read_results_csv: returns the latest RMS CSV or a specific file.
+
+Implemented simulation engine behavior
+--------------------------------------
+- SimulationConfig.from_json: loads known JSON keys into the dataclass.
+- Logger.info / Logger.ok / Logger.warn / Logger.error / Logger.section: console logging helpers.
+- DIgSILENTAgent.connect: connects to PowerFactory and activates the configured project.
+- DIgSILENTAgent.activate_study_case: activates or copies the configured study case.
+- DIgSILENTAgent.run_loadflow: runs ComLdf.
+- DIgSILENTAgent.run_rms_simulation: builds the event sequence and runs ComInc / ComSim.
+- DIgSILENTAgent._apply_fault_event: supports bus faults, line faults, and generator switch events.
+- DIgSILENTAgent.addSwitchEvent: creates PowerFactory EvtSwitch events.
+- DIgSILENTAgent.export_results_to_csv: exports the RMS results to CSV via ComRes.
+- DIgSILENTAgent.export_project_to_pfd: exports the active project to .pfd via ComPfdexport.
+- DIgSILENTAgent.generate_standard_plots: creates voltage and generator speed plots from the CSV output.
+- DIgSILENTAgent.import_project: imports a .pfd project file.
+- DIgSILENTAgent.create_study_case: creates or reuses study cases with exact-name matching.
+- DIgSILENTAgent.modify_parameter: writes attributes through SetAttribute with type coercion.
+- DIgSILENTAgent.short_circuit: runs ComShc.
+- DIgSILENTAgent.run_pipeline: orchestrates the full workflow and returns a structured report.
+- DIgSILENTAgent.close: closes PowerFactory and clears shared handles.
+
+Path handling
+-------------
+- PowerFactory Python path: set POWERFACTORY_PYTHON_PATH or PYTHONPATH.
+- Project and output folders: define them in simulation_config.json.
+- Example config: use simulation_config.example.json as the template and keep the real config out of Git.
+
+Internal helper functions
+-------------------------
+- Agent_DIgSILENT.py: _find_study_case_exact, _list_study_case_names, _prune_create_case_request_cache, _apply_show_preference, _ensure_run_output_dir
+- MCP_PowerFactory.py: _stderr_print, _pf, _load_modules, _to_json
+
+
