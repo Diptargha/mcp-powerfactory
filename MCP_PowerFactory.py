@@ -19,6 +19,9 @@ Tools
   run_simulation    Run the full pipeline from simulation_config.json.
   run_custom_case   Run a one-off case with parameters supplied at call-time.
   read_results_csv  Read the latest (or a specific) RMS results CSV.
+  build_network_from_sld  Parse a vector-PDF single-line diagram and build the
+                          PowerFactory network (buses/lines/gens/loads/trafos).
+  draw_sld          Auto-arrange the SLD for a grid via ComSgllayout.
 
 Usage
 -----
@@ -105,7 +108,31 @@ def _pf(fn, *args, **kwargs):
 
 
 def _load_modules():
-    """Deferred import — avoids startup crash when PowerFactory is not running."""
+    """Deferred import — avoids startup crash when PowerFactory is not running.
+
+    The agent module is reloaded on each call so edits to Agent_DIgSILENT.py
+    take effect without restarting the MCP server. Live PowerFactory handles
+    (stored as class attributes) are preserved across the reload.
+    """
+    import importlib
+    import Agent_DIgSILENT
+
+    prev = getattr(Agent_DIgSILENT, "DIgSILENTAgent", None)
+    saved = None
+    if prev is not None:
+        saved = (
+            getattr(prev, "_shared_app", None),
+            getattr(prev, "_shared_project", None),
+            getattr(prev, "_shared_project_path", None),
+        )
+
+    importlib.reload(Agent_DIgSILENT)
+
+    if saved is not None:
+        Agent_DIgSILENT.DIgSILENTAgent._shared_app = saved[0]
+        Agent_DIgSILENT.DIgSILENTAgent._shared_project = saved[1]
+        Agent_DIgSILENT.DIgSILENTAgent._shared_project_path = saved[2]
+
     from Agent_DIgSILENT import SimulationConfig, DIgSILENTAgent
     return SimulationConfig, DIgSILENTAgent
 
@@ -608,6 +635,97 @@ def read_results_csv(csv_path: str = "", max_rows: int = 2000, as_path: bool = F
         f"# truncated: {truncated}\n"
     )
     return csv_text + meta
+
+
+@mcp.tool()
+def build_network_from_sld(
+    pdf_path: str = "",
+    network_name: str = "SLD_Network",
+    page_index: int = 0,
+    overrides_path: str = "",
+    open_digsilent: bool = True,
+    project_name: str = "",
+) -> str:
+    """
+    Parse a vector-PDF single-line diagram (SLD) and build the network in
+    PowerFactory.
+
+    If ``project_name`` is provided, a fresh, empty PowerFactory project of that
+    name is created (replacing any existing one) and the network is built inside
+    it — so it never pollutes another project. Otherwise a project must already
+    be active (use import_project or create_study_case first) so the new grid
+    has a home. The diagram is parsed into buses, lines, generators, loads, and
+    transformers, which are created as ElmTerm/ElmLne/ElmSym/ElmLod/ElmTr2
+    objects (with TypLne/TypTr2/TypSym types) inside a new grid (ElmNet) named
+    ``network_name``. After building, a load flow (ComLdf) is run and its
+    convergence plus per-bus voltages are returned.
+
+    Works best on vector PDFs exported from CAD/Visio/ETAP, or PDFs that embed
+    an IEEE-style datasheet (text tables) — the latter is parsed exactly.
+    Misclassified elements can be corrected with an sld_overrides.json file.
+
+    Parameters
+    ----------
+    pdf_path : str
+        Absolute path to the vector SLD PDF. Required.
+    network_name : str
+        Name of the grid (ElmNet) to create/populate. Default "SLD_Network".
+    page_index : int
+        Page of the PDF to parse (default 0).
+    overrides_path : str
+        Optional path to an sld_overrides.json correction file. If empty, a file
+        named sld_overrides.json next to the PDF is used when present.
+    open_digsilent : bool
+        If True (default), requests the PowerFactory GUI window via app.Show().
+    project_name : str
+        If non-empty, create a fresh empty project with this name and build the
+        network inside it instead of using the currently active project.
+
+    Returns
+    -------
+    str
+        JSON string with success flag, parsed summary, created object counts,
+        per-element warnings, and the load-flow result.
+    """
+    if not pdf_path:
+        return json.dumps({"success": False, "message": "pdf_path is required"})
+
+    _, DIgSILENTAgent = _load_modules()
+    ok, report = _pf(
+        DIgSILENTAgent.build_network_from_sld,
+        pdf_path,
+        network_name,
+        page_index,
+        overrides_path,
+        open_digsilent,
+        project_name,
+    )
+    return _to_json({"success": ok, **report})
+
+
+@mcp.tool()
+def draw_sld(
+    network_name: str = "IEEE_14_Bus",
+    open_digsilent: bool = True,
+) -> str:
+    """
+    Run PowerFactory's automatic SLD layout engine (ComSgllayout) on a
+    named grid in the active project.
+
+    The grid must have been created first (e.g. via build_network_from_sld).
+    ComSgllayout creates graphic objects for every network element and
+    arranges them on a diagram board visible in the PowerFactory GUI.
+
+    Parameters
+    ----------
+    network_name : str
+        Name of the ElmNet grid to draw. Default "IEEE_14_Bus".
+    open_digsilent : bool
+        If True (default), ensures the PowerFactory GUI window is visible.
+    """
+    _, DIgSILENTAgent = _load_modules()
+    ok, msg = _pf(DIgSILENTAgent.draw_diagram, network_name, open_digsilent)
+    return json.dumps({"success": ok, "message": msg})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

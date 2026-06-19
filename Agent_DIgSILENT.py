@@ -118,17 +118,20 @@ class SimulationConfig:
     # Each entry: (object_name, variable_name, friendly_label)
     # Adjust names to match elements in your network model.
     signals: list = field(default_factory=lambda: [
-        # Bus voltages
-        ("Bus 01.ElmTerm",    "m:u",    "V_01_pu"),
-        ("Bus 02.ElmTerm",   "m:u",    "V_02_pu"),
-        ("Bus 03.ElmTerm",   "m:u",    "V_03_pu"),
+        # Bus voltages (Texas Grid terminals)
+        ("CRANE 0.ElmTerm",      "m:u",    "V_CRANE_pu"),
+        ("HOUSTON 14 0.ElmTerm", "m:u",    "V_HOUSTON14_pu"),
+        ("ABILENE 1 0.ElmTerm",  "m:u",    "V_ABILENE1_pu"),
+        ("ALPINE 0.ElmTerm",     "m:u",    "V_ALPINE_pu"),
 
-        # # Generator rotor angles
-        # ("Gen 01.ElmSym",       "s:firel","Angle_CS1_deg"),
-        # ("Gen 02.ElmSym",       "s:firel","Angle_CS2_deg"),
+        # Generator speeds (Texas Grid synchronous machines)
+        ("sym_1073_1.ElmSym",    "s:speed", "Speed_1073_pu"),
+        ("sym_1033_1.ElmSym",    "s:speed", "Speed_1033_pu"),
+        ("sym_1004_1.ElmSym",    "s:speed", "Speed_1004_pu"),
 
-        # # System frequency (measured at reference bus or machine)
-        # ("Gen 01.ElmSym",       "m:f",    "Freq_CS1_Hz"),
+        # Generator rotor angles
+        ("sym_1073_1.ElmSym",    "s:firel", "Angle_1073_deg"),
+        ("sym_1033_1.ElmSym",    "s:firel", "Angle_1033_deg"),
     ])
 
 
@@ -444,6 +447,9 @@ class DIgSILENTAgent:
             log.info(f"Applying fault at t={self.cfg.t_fault}s, clearing at t={self.cfg.t_clear}s")
             self._apply_fault_event()
 
+            # -- Register monitored variables in the result object ----
+            reg_summary = self._register_result_variables()
+
             # -- Initialise simulation --------------------------------
             inc = self.app.GetFromStudyCase('ComInc')
             inc.iopt_sim   = 'rms'
@@ -465,11 +471,65 @@ class DIgSILENTAgent:
             if err:
                 raise RuntimeError(f"ComSim returned error code {err}")
             log.ok(f"RMS simulation completed | t_end={self.cfg.t_end}s")
-            return True, "RMS simulation OK"
+            return True, f"RMS simulation OK | signals: {reg_summary}"
 
         except Exception as e:
             log.error(f"RMS simulation failed: {e}")
             return False, str(e)
+
+    def _register_result_variables(self) -> str:
+        """Register the configured monitored signals on the result object.
+
+        Without this step the RMS result object only records the time vector,
+        which produces a CSV with a single column (and unusable plots).
+
+        Returns a short human-readable summary of what was registered.
+        """
+        try:
+            res = self.app.GetFromStudyCase(self.cfg.result_name)
+            if res is None:
+                msg = f"result object '{self.cfg.result_name}' not found"
+                log.warn(f"{msg} — skipping variable registration")
+                return msg
+
+            registered = 0
+            failed = []
+            missing = []
+            for entry in getattr(self.cfg, "signals", []) or []:
+                try:
+                    obj_name, var_name = entry[0], entry[1]
+                except (TypeError, IndexError):
+                    continue
+
+                elements = self.app.GetCalcRelevantObjects(obj_name) or []
+                if not elements:
+                    missing.append(obj_name)
+                    continue
+
+                try:
+                    res.AddVariable(elements[0], var_name)
+                    registered += 1
+                except Exception as add_err:
+                    failed.append(f"{obj_name}:{var_name} ({add_err})")
+
+            if registered:
+                log.ok(f"Registered {registered} monitored variable(s) on '{self.cfg.result_name}'")
+            if missing:
+                log.warn(f"Signals not found and skipped: {', '.join(sorted(set(missing)))}")
+            if failed:
+                log.warn(f"AddVariable failed for: {', '.join(failed)}")
+            if not registered:
+                log.warn("No monitored variables registered — CSV will contain only the time column")
+
+            summary = f"{registered} registered"
+            if missing:
+                summary += f", {len(missing)} missing"
+            if failed:
+                summary += f", {len(failed)} failed"
+            return summary
+        except Exception as e:
+            log.warn(f"Could not register result variables: {e}")
+            return f"registration error: {e}"
 
     def _apply_fault_event(self):
         """
@@ -799,6 +859,64 @@ class DIgSILENTAgent:
                 cls._shared_project_path = None
 
     # ──────────────────────────────────────────────────────────────
+    # CREATE NEW PROJECT — fresh, empty project for a clean build
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def _create_new_project(cls, app, project_name: str):
+        """Create and activate a fresh, empty PowerFactory project.
+
+        Any pre-existing project of the same name is deleted first so the build
+        is idempotent. A minimal study case is created and activated so that
+        calculation commands (ComLdf, etc.) are available.
+        """
+        user = app.GetCurrentUser()
+        if user is None:
+            raise RuntimeError("GetCurrentUser() returned None")
+
+        # Delete a same-named project for a clean rebuild.
+        for old in user.GetContents(f"{project_name}.IntPrj") or []:
+            try:
+                old.Delete()
+                log.info(f"Deleted existing project for clean rebuild: {project_name}")
+            except Exception as e:
+                log.warn(f"Could not delete existing project '{project_name}': {e}")
+
+        prj = user.CreateObject("IntPrj", project_name)
+        if prj is None:
+            raise RuntimeError(f"Failed to create project '{project_name}'")
+        prj.Activate()
+
+        # A study case is required for calculation commands to exist.
+        study_folder = app.GetProjectFolder("study")
+        case_parent = study_folder if study_folder is not None else prj
+        sc = case_parent.CreateObject("IntCase", "Study Case")
+        if sc is not None:
+            sc.Activate()
+
+        cls._shared_project = prj
+        cls._shared_project_path = None  # not activated via path
+        log.ok(f"Created and activated new project: {project_name}")
+        return prj
+
+    @staticmethod
+    def _collect_bus_voltages(app) -> dict:
+        """Return {bus_name: voltage_pu} for all calc-relevant terminals."""
+        out: dict = {}
+        try:
+            terminals = app.GetCalcRelevantObjects("*.ElmTerm") or []
+        except Exception:
+            return out
+        for term in terminals:
+            try:
+                name = term.loc_name
+                v = term.GetAttribute("m:u")  # voltage magnitude in p.u.
+                out[name] = round(float(v), 4)
+            except Exception:
+                continue
+        return out
+
+    # ──────────────────────────────────────────────────────────────
     # IMPORT PROJECT — load a .pfd file into PowerFactory
     # ──────────────────────────────────────────────────────────────
 
@@ -854,6 +972,214 @@ class DIgSILENTAgent:
 
         except Exception as e:
             log.error(f"Project import failed: {e}")
+            return False, str(e)
+
+    # ──────────────────────────────────────────────────────────────
+    # BUILD NETWORK FROM SLD — parse a vector PDF and create the model
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def build_network_from_sld(
+        cls,
+        pdf_path: str,
+        network_name: str = "SLD_Network",
+        page_index: int = 0,
+        overrides_path: str = "",
+        open_digsilent: bool = True,
+        project_name: str = "",
+    ) -> tuple[bool, dict]:
+        """Parse a single-line-diagram PDF and build the PowerFactory network.
+
+        If ``project_name`` is given, a fresh empty project of that name is
+        created (replacing any existing one) and the network is built inside it.
+        Otherwise a project must already be active so the new grid has a home.
+        The parsing stage does not touch PowerFactory; only the build stage uses
+        the API. After the build a load flow (ComLdf) is run and its convergence
+        is reported.
+
+        Parameters
+        ----------
+        pdf_path : str
+            Absolute path to the vector SLD PDF.
+        network_name : str
+            Name of the grid (ElmNet) to create/populate.
+        page_index : int
+            Page of the PDF to parse (default 0).
+        overrides_path : str
+            Optional path to an sld_overrides.json correction file.
+        open_digsilent : bool
+            If True (default), show the PowerFactory GUI window.
+        project_name : str
+            If non-empty, create a new empty project with this name instead of
+            using the currently active project.
+
+        Returns
+        -------
+        (success, report) where report contains the topology summary, the
+        builder result (created counts and warnings), and the load-flow result.
+        """
+        global pf
+        if pf is None:
+            _ensure_powerfactory_on_path()
+            import powerfactory as pf
+
+        log.section("BUILD NETWORK FROM SLD")
+
+        # -- Stage A: parse the PDF (no PowerFactory dependency) -------
+        try:
+            import importlib
+            import sld_parser
+            importlib.reload(sld_parser)  # pick up edits without MCP restart
+            cfg = sld_parser.ParseConfig(page_index=page_index)
+            topology = sld_parser.parse_sld(
+                pdf_path, cfg, overrides_path or None
+            )
+            summary = topology.get("summary", {})
+            log.ok(f"Parsed SLD: {summary}")
+        except Exception as e:
+            log.error(f"SLD parsing failed: {e}")
+            return False, {"stage": "parse", "error": str(e)}
+
+        if not topology.get("buses"):
+            msg = "No buses detected in the SLD — nothing to build."
+            log.error(msg)
+            return False, {"stage": "parse", "error": msg, "summary": summary}
+
+        # -- Stage B: acquire app + ensure a project is active --------
+        try:
+            if cls._shared_app is None:
+                app = pf.GetApplicationExt()
+                if app is None:
+                    raise RuntimeError("GetApplicationExt() returned None")
+                cls._apply_show_preference(app, open_digsilent)
+                cls._shared_app = app
+            else:
+                app = cls._shared_app
+                cls._apply_show_preference(app, open_digsilent)
+
+            if project_name:
+                cls._create_new_project(app, project_name)
+            elif app.GetActiveProject() is None:
+                raise RuntimeError(
+                    "No active PowerFactory project. Import or activate a "
+                    "project before building a network (or pass project_name)."
+                )
+        except Exception as e:
+            log.error(f"Cannot access PowerFactory application/project: {e}")
+            return False, {"stage": "connect", "error": str(e), "summary": summary}
+
+        # -- Stage C: build the network -------------------------------
+        try:
+            import importlib
+            import pf_network_builder
+            importlib.reload(pf_network_builder)  # pick up edits without MCP restart
+            result = pf_network_builder.build_network(
+                app, topology, network_name, log=log
+            )
+            report = {
+                "stage": "build",
+                "summary": summary,
+                "grid": result.get("grid"),
+                "created": result.get("created"),
+                "warnings": result.get("warnings", []),
+            }
+        except Exception as e:
+            log.error(f"Network build failed: {e}")
+            return False, {"stage": "build", "error": str(e), "summary": summary}
+
+        # -- Stage D: run a load flow to validate the model -----------
+        try:
+            ldf = app.GetFromStudyCase("ComLdf")
+            if ldf is None:
+                report["loadflow"] = {"converged": False,
+                                      "message": "ComLdf not found in study case"}
+                log.warn("ComLdf not found; skipping load-flow validation")
+                return True, report
+
+            err = ldf.Execute()
+            converged = (err == 0)
+            voltages = cls._collect_bus_voltages(app) if converged else {}
+            report["loadflow"] = {
+                "converged": converged,
+                "error_code": err,
+                "bus_voltages_pu": voltages,
+            }
+            if converged:
+                log.ok(f"Load flow converged. {len(voltages)} bus voltages collected.")
+            else:
+                log.warn(f"Load flow did NOT converge (ComLdf error code {err}).")
+            return True, report
+        except Exception as e:
+            log.error(f"Load flow step failed: {e}")
+            report["loadflow"] = {"converged": False, "message": str(e)}
+            return True, report
+
+    # ──────────────────────────────────────────────────────────────
+    # DRAW DIAGRAM — auto-arrange the SLD with ComSgllayout
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def draw_diagram(
+        cls,
+        network_name: str = "IEEE_14_Bus",
+        open_digsilent: bool = True,
+    ) -> tuple[bool, str]:
+        """Run ComSgllayout to auto-arrange the SLD for a named grid.
+
+        The grid must already exist in the active project (built via
+        build_network_from_sld). ComSgllayout creates graphic objects for
+        every network element and positions them using PF's auto-layout engine.
+        """
+        global pf
+        if pf is None:
+            _ensure_powerfactory_on_path()
+            import powerfactory as pf
+
+        log.section("DRAW SLD DIAGRAM")
+
+        try:
+            if cls._shared_app is None:
+                app = pf.GetApplicationExt()
+                if app is None:
+                    raise RuntimeError("GetApplicationExt() returned None")
+                cls._apply_show_preference(app, open_digsilent)
+                cls._shared_app = app
+            else:
+                app = cls._shared_app
+                cls._apply_show_preference(app, open_digsilent)
+
+            if app.GetActiveProject() is None:
+                raise RuntimeError("No active project. Build the network first.")
+
+            # Locate the target grid.
+            netdat = app.GetProjectFolder("netdat")
+            if netdat is None:
+                raise RuntimeError("netdat folder not found")
+            grids = netdat.GetContents(f"{network_name}.ElmNet") or []
+            if not grids:
+                raise RuntimeError(f"Grid '{network_name}' not found in netdat")
+            grid = grids[0]
+
+            # Get or create the layout command in the active study case.
+            layout = app.GetFromStudyCase("ComSgllayout")
+            if layout is None:
+                sc = app.GetActiveStudyCase()
+                if sc is None:
+                    raise RuntimeError("No active study case")
+                layout = sc.CreateObject("ComSgllayout", "SLD Layout")
+                if layout is None:
+                    raise RuntimeError("Could not create ComSgllayout object")
+
+            layout.SetAttribute("pGrid", grid)
+            err = layout.Execute()
+            if err:
+                return False, f"ComSgllayout.Execute() returned error code {err}"
+
+            log.ok(f"ComSgllayout completed for grid '{network_name}'")
+            return True, f"SLD diagram drawn for grid '{network_name}'"
+
+        except Exception as e:
+            log.error(f"draw_diagram failed: {e}")
             return False, str(e)
 
     # ──────────────────────────────────────────────────────────────
@@ -1276,6 +1602,9 @@ class DIgSILENTAgent:
         """
         Execute the full pipeline and return a status report dict.
         Each step is guarded: a failure stops the pipeline early.
+
+        Per-step wall-clock durations (seconds) are recorded under
+        ``report["timings"]``, along with ``report["timings"]["total"]``.
         """
         report = {
             "connect":          None,
@@ -1287,8 +1616,19 @@ class DIgSILENTAgent:
             "pfd_export":       None,
             "csv_path":         None,
             "pfd_path":         None,
+            "timings":          {},
             "success":          False,
         }
+
+        timings = report["timings"]
+        pipeline_start = time.perf_counter()
+
+        def _record(step_key: str, fn):
+            """Run a step, record its duration, and return (ok, msg)."""
+            step_start = time.perf_counter()
+            ok, msg = fn()
+            timings[step_key] = round(time.perf_counter() - step_start, 3)
+            return ok, msg
 
         steps = [
             ("connect",        self.connect),
@@ -1299,37 +1639,42 @@ class DIgSILENTAgent:
         ]
 
         for key, fn in steps:
-            ok, msg = fn()
+            ok, msg = _record(key, fn)
             report[key] = {"ok": ok, "msg": msg}
             if not ok:
+                timings["total"] = round(time.perf_counter() - pipeline_start, 3)
                 log.error(f"Pipeline stopped at step '{key}': {msg}")
                 return report
 
         # -- Standard plots (always enabled by default) ----------------
         csv_path = report["csv_export"]["msg"]
         if report["csv_export"]["ok"] and csv_path:
-            ok, msg = self.generate_standard_plots(csv_path)
+            ok, msg = _record("standard_plots", lambda: self.generate_standard_plots(csv_path))
             report["standard_plots"] = {"ok": ok, "msg": msg}
             if not ok:
                 log.warn(f"Standard plots generation failed, continuing anyway: {msg}")
         else:
+            timings["standard_plots"] = 0.0
             report["standard_plots"] = {"ok": True, "msg": "Skipped (no CSV available)"}
 
         do_export_pfd = bool(getattr(self.cfg, "export_pfd", 0))
         if do_export_pfd:
-            ok, msg = self.export_project_to_pfd()
+            ok, msg = _record("pfd_export", self.export_project_to_pfd)
             report["pfd_export"] = {"ok": ok, "msg": msg}
             if not ok:
+                timings["total"] = round(time.perf_counter() - pipeline_start, 3)
                 log.error(f"Pipeline stopped at step 'pfd_export': {msg}")
                 return report
             report["pfd_path"] = msg
         else:
+            timings["pfd_export"] = 0.0
             report["pfd_export"] = {"ok": True, "msg": "Skipped (export_pfd=0)"}
 
+        timings["total"] = round(time.perf_counter() - pipeline_start, 3)
         report["csv_path"] = report["csv_export"]["msg"]
         report["success"]  = True
         log.section("PIPELINE COMPLETE")
-        log.ok(f"All steps passed. Results → {report['csv_path']}")
+        log.ok(f"All steps passed in {timings['total']}s. Results → {report['csv_path']}")
         return report
 
 

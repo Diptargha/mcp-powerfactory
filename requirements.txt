@@ -6,6 +6,11 @@ numpy>=1.26
 matplotlib>=3.8
 pandas>=1.5
 
+# Single-line-diagram (SLD) PDF parsing → network builder
+pymupdf>=1.24          # vector PDF extraction (imports as fitz)
+networkx>=3.2          # topology graph
+shapely>=2.0           # geometric proximity tests (symbol detection)
+
 # DIgSILENT PowerFactory Python API
 # -------------------------------------------------------
 # The "powerfactory" module is bundled with PowerFactory
