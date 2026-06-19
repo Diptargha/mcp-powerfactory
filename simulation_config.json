@@ -1,9 +1,10 @@
 {
-    "project_path":    "\\<powerfactory_project_path>",
-    "study_case":      "Case 1",
-    "base_study_case": "0. Base",
+    "powerfactory_path": "C:\\Program Files\\DIgSILENT\\PowerFactory 2024 SP5A\\Python\\3.12",
+    "project_path":    "Texas Grid",
+    "study_case":      "02 Load Flow Analysis",
+    "base_study_case": "01 Base Case",
 
-    "output_dir":   "C:\\<output_folder>",
+    "output_dir":   "C:\\Users\\z004z29x\\PycharmProjects\\mcp-powerfactory\\results",
     "run_label":    "Test_1",
     "result_name":  "All calculations.ElmRes",
     "export_graph": 0,
@@ -20,7 +21,7 @@
         {
             "case_name": "Fault_1",
             "fault_type": "bus",
-            "fault_element": "Bus 25.ElmTerm",
+            "fault_element": "CRANE 0.ElmTerm",
             "t_start": 0.0,
             "t_fault": 1.0,
             "t_clear": 1.08,
@@ -31,7 +32,7 @@
         {
             "case_name": "Fault_2",
             "fault_type": "line",
-            "fault_element": "Line 03 - 04.ElmLne",
+            "fault_element": "lne_1016_1034_1.ElmLne",
             "t_start": 0.0,
             "t_fault": 1.0,
             "t_clear": 1.08,
@@ -42,7 +43,7 @@
         {
         "case_name": "Fault_3",
         "fault_type": "gen_switch",
-        "switch_element": "G 07.ElmSym",
+        "switch_element": "sym_1073_1.ElmSym",
         "t_switch": 1.0,
         "switch_state": 0,
         "t_end": 10.0,

@@ -467,8 +467,7 @@ def run_custom_case(
     if create_new_study_case:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         cfg.study_case = f"{case_name}_{ts}"
-    else:
-        cfg.study_case = case_name
+    # else: keep study_case from simulation_config.json (e.g. "02 Load Flow Analysis")
 
     cfg.fault_type     = fault_type
     cfg.fault_element  = fault_element

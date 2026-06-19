@@ -223,6 +223,36 @@ class DIgSILENTAgent:
                 return case
         return None
 
+    def _find_study_case_in_project(self, case_name: str):
+        """Find an IntCase anywhere in the active project by exact loc_name."""
+        if not case_name:
+            return None
+
+        candidates = []
+        try:
+            candidates.extend(self.app.GetCalcRelevantObjects("*.IntCase") or [])
+        except Exception:
+            pass
+        try:
+            candidates.extend(self.app.GetCalcRelevantObjects(f"{case_name}.IntCase") or [])
+        except Exception:
+            pass
+        if self.project is not None:
+            try:
+                candidates.extend(self.project.GetContents("*.IntCase", 1) or [])
+            except Exception:
+                pass
+
+        seen = set()
+        for case in candidates:
+            case_id = id(case)
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            if getattr(case, "loc_name", None) == case_name:
+                return case
+        return None
+
     @staticmethod
     def _list_study_case_names(folder) -> set[str]:
         """Return all study case loc_name values in the study folder."""
@@ -262,7 +292,15 @@ class DIgSILENTAgent:
                 _ensure_powerfactory_on_path()
                 import powerfactory as pf
             if DIgSILENTAgent._shared_app is None:
-                self.app = pf.GetApplicationExt()
+                try:
+                    self.app = pf.GetApplicationExt()
+                except Exception as ext_err:
+                    self.app = pf.GetApplication()
+                    if self.app is None:
+                        raise RuntimeError(
+                            f"GetApplicationExt() failed ({ext_err}); "
+                            "GetApplication() also returned None"
+                        ) from ext_err
                 if self.app is None:
                     raise RuntimeError("GetApplicationExt() returned None")
                 self._apply_show_preference(self.app, open_digsilent)
@@ -332,13 +370,42 @@ class DIgSILENTAgent:
                 # Non-standard project: search the whole project for *.IntCase by name
                 log.warn("GetProjectFolder('study') returned None — searching project for IntCase objects")
                 case_name = target_name.split('\\')[-1]
-                matches = self.app.GetCalcRelevantObjects(f"{case_name}.IntCase")
-                if not matches:
-                    raise RuntimeError(
-                        f"Study case '{case_name}' not found via GetCalcRelevantObjects either. "
-                        "Check the name in PowerFactory's Data Manager."
-                    )
-                matches[0].Activate()
+                target_case = self._find_study_case_in_project(case_name)
+                if target_case is not None:
+                    target_case.Activate()
+                else:
+                    base_case = self._find_study_case_in_project(base_name)
+                    if base_case is not None:
+                        if case_name == base_name:
+                            base_case.Activate()
+                        else:
+                            parent = base_case.GetParent()
+                            if parent is None:
+                                raise RuntimeError(
+                                    f"Cannot copy study case '{base_name}': parent folder not found"
+                                )
+                            new_study_case = parent.AddCopy(base_case, case_name)
+                            if new_study_case is None:
+                                new_study_case = self._find_study_case_in_project(case_name)
+                                if new_study_case is None:
+                                    raise RuntimeError(
+                                        f"Study case copy failed: '{case_name}'"
+                                    )
+                            new_study_case.Activate()
+                            log.ok(f"Study case copied from '{base_name}' to '{case_name}'")
+                    else:
+                        active = self.app.GetActiveStudyCase()
+                        if active is None:
+                            raise RuntimeError(
+                                f"Study case '{case_name}' not found and no active study case is available. "
+                                "Activate a study case in PowerFactory or check the names in the config."
+                            )
+                        active_name = getattr(active, "loc_name", "active")
+                        log.warn(
+                            f"Study case '{case_name}' not found; "
+                            f"continuing with active study case '{active_name}'"
+                        )
+                        return True, f"Using active study case: {active_name}"
 
             log.ok(f"Study case activated: {target_name}")
             return True, "Study case activated"
