@@ -1,5 +1,5 @@
 {
-    "powerfactory_path": "C:\\Program Files\\DIgSILENT\\PowerFactory 2024 SP5A\\Python\\3.12",
+    "powerfactory_python_path": "C:\\Program Files\\DIgSILENT\\PowerFactory 2024 SP5A\\Python\\3.12",
     "project_path":    "Texas Grid",
     "study_case":      "02 Load Flow Analysis",
     "base_study_case": "01 Base Case",

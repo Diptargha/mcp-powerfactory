@@ -63,7 +63,8 @@ pf = None
 @dataclass
 class SimulationConfig:
     """All parameters needed to run one RMS simulation."""
-
+    # ── Module ───────────────────────────────────────────────────
+    powerfactory_python_path: str = ""
     # ── Project ───────────────────────────────────────────────────
     project_path: str = ""
     study_case:   str = r"ctocto"
@@ -1341,6 +1342,8 @@ if __name__ == "__main__":
     # ── Load config from JSON (edit simulation_config.json, not this file)
     _cfg_path = os.path.join(os.path.dirname(__file__), "simulation_config.json")
     cfg = SimulationConfig.from_json(_cfg_path)
+
+    sys.path.append(cfg.powerfactory_python_path)
 
     agent  = DIgSILENTAgent(cfg)
     report = agent.run_pipeline()
