@@ -203,6 +203,8 @@ def build_network(app,
                       f"type '{name}'")
             _safe_set(typ, "uline", bus_kv.get(b1, 110.0), warnings,
                       f"type '{name}'")
+            _safe_set(typ, "bline", _attr(ln, "b_us_per_km", 0.0), warnings,
+                      f"type '{name}'")  # shunt charging susceptance (µS/km)
             _safe_set(typ, "sline", 1.0, warnings, f"type '{name}'")  # kA rating
             _safe_set(typ, "nlnph", 3, warnings, f"type '{name}'")
             _set_first(elm, ["typ_id"], typ, warnings, f"line '{name}' typ_id")
@@ -249,7 +251,14 @@ def build_network(app,
             _safe_set(typ, "utrn_l", kv_lv, warnings, f"ttype '{name}'")
             _safe_set(typ, "uktr", uk_pct, warnings, f"ttype '{name}'")
             _safe_set(typ, "pcutr", 0.0, warnings, f"ttype '{name}'")  # copper losses
-            _safe_set(typ, "vecgrp", "YNd5", warnings, f"ttype '{name}'")
+            # Vector group: wye/wye with ZERO phase shift. This is a per-unit
+            # benchmark with no transformer phase displacement; a spurious shift
+            # on the 11-12-13 transformer loop would inject huge circulating
+            # flow and break load-flow convergence. ('vecgrp' itself is a derived
+            # string and not directly writable, so set the components instead.)
+            _safe_set(typ, "tr2cn_h", "YN", warnings, f"ttype '{name}'")
+            _safe_set(typ, "tr2cn_l", "YN", warnings, f"ttype '{name}'")
+            _safe_set(typ, "nt2ag", 0, warnings, f"ttype '{name}'")
             # Tap changer on HV side: 1% steps so we can realise the off-nominal ratio.
             _safe_set(typ, "tap_side", 0, warnings, f"ttype '{name}'")
             _safe_set(typ, "dutap", 1.0, warnings, f"ttype '{name}'")
@@ -269,6 +278,8 @@ def build_network(app,
     # av_mode 'constv' = local voltage control; ip_ctrl=1 marks the slack
     # (reference) machine. Sync. condensers are voltage-controlled with P=0.
     n_gens = 0
+    slack_elems: list[Any] = []      # generators flagged as reference machine
+    biggest = {"elm": None, "p": -1.0}  # fallback reference if none flagged
     for g in topology.get("generators", []):
         name = _attr(g, "loc_name")
         bus = _attr(g, "bus")
@@ -286,6 +297,10 @@ def build_network(app,
         bus_type = _attr(g, "bus_type", "PV")
         is_slack = (bus_type == "slack")
         p_mw = 0.0 if bus_type == "sync_cond" else _attr(g, "p_mw", 0.0)
+        if is_slack:
+            slack_elems.append(elm)
+        if p_mw > biggest["p"]:
+            biggest = {"elm": elm, "p": p_mw}
 
         for stale in type_folder.GetContents(f"typ_{name}.TypSym") or []:
             try:
@@ -307,6 +322,15 @@ def build_network(app,
         _safe_set(elm, "av_mode", "constv", warnings, f"gen '{name}'")
         _safe_set(elm, "ip_ctrl", 1 if is_slack else 0, warnings, f"gen '{name}'")
         n_gens += 1
+
+    # A load flow needs exactly one reference (slack) machine. If the datasheet
+    # role column did not flag one, promote the largest generator so ComLdf can
+    # still run instead of aborting with "no reference machine".
+    if not slack_elems and biggest["elm"] is not None:
+        _safe_set(biggest["elm"], "ip_ctrl", 1, warnings, "gen (auto-slack)")
+        warnings.append(
+            f"no slack in datasheet — promoted '{biggest['elm'].loc_name}' "
+            f"(P={biggest['p']} MW) to reference machine")
     log.ok(f"Created {n_gens} generator(s)")
 
     # ── Loads (ElmLod) ────────────────────────────────────────────

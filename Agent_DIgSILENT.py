@@ -916,6 +916,197 @@ class DIgSILENTAgent:
                 continue
         return out
 
+    @staticmethod
+    def _diagnose_loadflow(app) -> list:
+        """Inspect the active network for common load-flow abort causes.
+
+        Returns a list of human-readable problem strings (empty if none found).
+        Checks: a reference/slack machine exists, line rated voltage matches
+        both terminal nominal voltages, and transformer winding voltages match
+        their HV/LV terminal nominal voltages. These are the conditions that
+        make ComLdf refuse to run ("connected between different voltage levels",
+        "nominal voltage differs", "no reference machine").
+        """
+        problems: list = []
+
+        def _term_kv(cubicle):
+            try:
+                term = cubicle.GetAttribute("cterm")
+                return float(term.GetAttribute("uknom"))
+            except Exception:
+                return None
+
+        def _close(a, b, tol=0.01):
+            return a is not None and b is not None and abs(a - b) <= tol * max(abs(b), 1.0)
+
+        try:
+            syms = app.GetCalcRelevantObjects("*.ElmSym") or []
+            xnets = app.GetCalcRelevantObjects("*.ElmXnet") or []
+            n_ref = 0
+            for s in syms:
+                try:
+                    if int(s.GetAttribute("ip_ctrl")) == 1:
+                        n_ref += 1
+                except Exception:
+                    pass
+            for x in xnets:
+                try:
+                    if int(x.GetAttribute("bustp")) == 0:  # SL reference
+                        n_ref += 1
+                except Exception:
+                    n_ref += 1
+            if n_ref == 0:
+                problems.append("No reference/slack machine found (set one generator's "
+                                "ip_ctrl=1 or add an external grid).")
+            elif n_ref > 1:
+                problems.append(f"{n_ref} reference machines found (expected exactly 1).")
+        except Exception:
+            pass
+
+        try:
+            for ln in app.GetCalcRelevantObjects("*.ElmLne") or []:
+                try:
+                    typ = ln.GetAttribute("typ_id")
+                    uline = float(typ.GetAttribute("uline")) if typ else None
+                    k1 = _term_kv(ln.GetAttribute("bus1"))
+                    k2 = _term_kv(ln.GetAttribute("bus2"))
+                    if k1 is not None and k2 is not None and not _close(k1, k2):
+                        problems.append(
+                            f"line '{ln.loc_name}': terminals at different voltage "
+                            f"levels ({k1} kV vs {k2} kV).")
+                    elif uline is not None and k1 is not None and not _close(uline, k1):
+                        problems.append(
+                            f"line '{ln.loc_name}': rated voltage {uline} kV differs "
+                            f"from terminal {k1} kV.")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        try:
+            for tr in app.GetCalcRelevantObjects("*.ElmTr2") or []:
+                try:
+                    typ = tr.GetAttribute("typ_id")
+                    if not typ:
+                        continue
+                    uh = float(typ.GetAttribute("utrn_h"))
+                    ul = float(typ.GetAttribute("utrn_l"))
+                    kh = _term_kv(tr.GetAttribute("bushv"))
+                    kl = _term_kv(tr.GetAttribute("buslv"))
+                    if kh is not None and not _close(uh, kh):
+                        problems.append(
+                            f"transformer '{tr.loc_name}': HV winding {uh} kV differs "
+                            f"from terminal {kh} kV.")
+                    if kl is not None and not _close(ul, kl):
+                        problems.append(
+                            f"transformer '{tr.loc_name}': LV winding {ul} kV differs "
+                            f"from terminal {kl} kV.")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Electrical-island check: every terminal must be reachable from the
+        # reference machine through in-service branches, otherwise ComLdf aborts.
+        try:
+            terms = app.GetCalcRelevantObjects("*.ElmTerm") or []
+            tid = {id(t): i for i, t in enumerate(terms)}
+            parent = list(range(len(terms)))
+
+            def _find(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+
+            def _union(a, b):
+                ra, rb = _find(a), _find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+            def _idx(cubicle):
+                try:
+                    t = cubicle.GetAttribute("cterm")
+                    return tid.get(id(t))
+                except Exception:
+                    return None
+
+            n_branches = 0
+            for cls_, ends in (("*.ElmLne", ("bus1", "bus2")),
+                               ("*.ElmTr2", ("bushv", "buslv")),
+                               ("*.ElmTr3", ("bushv", "busmv"))):
+                for br in app.GetCalcRelevantObjects(cls_) or []:
+                    try:
+                        if int(br.GetAttribute("outserv")) == 1:
+                            continue
+                    except Exception:
+                        pass
+                    idxs = [_idx(br.GetAttribute(e)) for e in ends]
+                    idxs = [i for i in idxs if i is not None]
+                    for k in range(1, len(idxs)):
+                        _union(idxs[0], idxs[k])
+                        n_branches += 1
+
+            if terms and n_branches:
+                roots = {}
+                for i in range(len(terms)):
+                    roots.setdefault(_find(i), []).append(i)
+                if len(roots) > 1:
+                    sizes = sorted((len(v) for v in roots.values()), reverse=True)
+                    problems.append(
+                        f"network splits into {len(roots)} electrical islands "
+                        f"(terminal counts {sizes}); every island needs a reference "
+                        f"or they must be connected.")
+        except Exception:
+            pass
+
+        # Anomalous element data that can make PowerFactory refuse the solve.
+        try:
+            for ln in app.GetCalcRelevantObjects("*.ElmLne") or []:
+                try:
+                    typ = ln.GetAttribute("typ_id")
+                    dline = float(ln.GetAttribute("dline"))
+                    r = float(typ.GetAttribute("rline")) * dline
+                    x = float(typ.GetAttribute("xline")) * dline
+                    if abs(r) + abs(x) < 1e-9:
+                        problems.append(f"line '{ln.loc_name}': ~zero impedance "
+                                        f"(R={r}, X={x} ohm).")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        try:
+            for g in app.GetCalcRelevantObjects("*.ElmSym") or []:
+                try:
+                    typ = g.GetAttribute("typ_id")
+                    ugn = float(typ.GetAttribute("ugn")) if typ else None
+                    sgn = float(typ.GetAttribute("sgn")) if typ else None
+                    kb = _term_kv(g.GetAttribute("bus1"))
+                    if ugn is not None and kb is not None and not _close(ugn, kb, 0.05):
+                        problems.append(
+                            f"generator '{g.loc_name}': rated voltage {ugn} kV differs "
+                            f"from terminal {kb} kV.")
+                    if sgn is not None and sgn <= 0:
+                        problems.append(
+                            f"generator '{g.loc_name}': non-positive rating {sgn} MVA.")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        try:
+            gp = sum(float(g.GetAttribute("pgini"))
+                     for g in app.GetCalcRelevantObjects("*.ElmSym") or [])
+            lp = sum(float(l.GetAttribute("plini"))
+                     for l in app.GetCalcRelevantObjects("*.ElmLod") or [])
+            problems.append(f"[info] generation {gp:.1f} MW vs load {lp:.1f} MW "
+                            f"(slack must cover {lp - gp:+.1f} MW + losses).")
+        except Exception:
+            pass
+
+        return problems
+
     # ──────────────────────────────────────────────────────────────
     # IMPORT PROJECT — load a .pfd file into PowerFactory
     # ──────────────────────────────────────────────────────────────
@@ -1025,8 +1216,12 @@ class DIgSILENTAgent:
 
         log.section("BUILD NETWORK FROM SLD")
 
+        import time as _time
+        timings: dict[str, float] = {}
+
         # -- Stage A: parse the PDF (no PowerFactory dependency) -------
         try:
+            _t0 = _time.perf_counter()
             import importlib
             import sld_parser
             importlib.reload(sld_parser)  # pick up edits without MCP restart
@@ -1035,7 +1230,8 @@ class DIgSILENTAgent:
                 pdf_path, cfg, overrides_path or None
             )
             summary = topology.get("summary", {})
-            log.ok(f"Parsed SLD: {summary}")
+            timings["read_sld_s"] = round(_time.perf_counter() - _t0, 3)
+            log.ok(f"Parsed SLD in {timings['read_sld_s']}s: {summary}")
         except Exception as e:
             log.error(f"SLD parsing failed: {e}")
             return False, {"stage": "parse", "error": str(e)}
@@ -1047,6 +1243,7 @@ class DIgSILENTAgent:
 
         # -- Stage B: acquire app + ensure a project is active --------
         try:
+            _t0 = _time.perf_counter()
             if cls._shared_app is None:
                 app = pf.GetApplicationExt()
                 if app is None:
@@ -1076,6 +1273,8 @@ class DIgSILENTAgent:
             result = pf_network_builder.build_network(
                 app, topology, network_name, log=log
             )
+            timings["develop_network_s"] = round(_time.perf_counter() - _t0, 3)
+            log.ok(f"Built network in {timings['develop_network_s']}s")
             report = {
                 "stage": "build",
                 "summary": summary,
@@ -1089,13 +1288,231 @@ class DIgSILENTAgent:
 
         # -- Stage D: run a load flow to validate the model -----------
         try:
+            _t0 = _time.perf_counter()
             ldf = app.GetFromStudyCase("ComLdf")
             if ldf is None:
                 report["loadflow"] = {"converged": False,
                                       "message": "ComLdf not found in study case"}
+                report["timings"] = timings
                 log.warn("ComLdf not found; skipping load-flow validation")
                 return True, report
 
+            err = ldf.Execute()
+            converged = (err == 0)
+            voltages = cls._collect_bus_voltages(app) if converged else {}
+            timings["load_flow_s"] = round(_time.perf_counter() - _t0, 3)
+            report["loadflow"] = {
+                "converged": converged,
+                "error_code": err,
+                "bus_voltages_pu": voltages,
+            }
+            if not converged:
+                diagnostics = cls._diagnose_loadflow(app)
+                report["loadflow"]["diagnostics"] = diagnostics
+                for d in diagnostics:
+                    log.warn(f"  diagnostic: {d}")
+            report["timings"] = timings
+            if converged:
+                log.ok(f"Load flow converged in {timings['load_flow_s']}s. "
+                       f"{len(voltages)} bus voltages collected.")
+            else:
+                log.warn(f"Load flow did NOT converge (ComLdf error code {err}).")
+            return True, report
+        except Exception as e:
+            log.error(f"Load flow step failed: {e}")
+            report["loadflow"] = {"converged": False, "message": str(e)}
+            report["timings"] = timings
+            return True, report
+
+    # ──────────────────────────────────────────────────────────────
+    # BUILD IEEE 14-BUS — hardcoded standard test-case dataset
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def build_ieee14bus(
+        cls,
+        network_name: str = "IEEE_14_Bus",
+        project_name: str = "IEEE_14_Bus_Test",
+        open_digsilent: bool = True,
+    ) -> tuple[bool, dict]:
+        """Build the IEEE 14-bus standard test case in a new PowerFactory project.
+
+        All data is hardcoded from the standard dataset (100 MVA, 60 Hz base).
+        No external PDF is required. A fresh project is created (replacing any
+        existing one), the network is built and commissioned, a load flow is run,
+        and the result is returned.
+        """
+        import importlib
+        import sld_parser
+        importlib.reload(sld_parser)
+
+        # ── Hardcoded IEEE 14-bus topology ────────────────────────
+        base_mva = 100.0
+
+        bus_data = [
+            # (bus_no, kv)
+            (1, 69.0), (2, 69.0), (3, 69.0), (4, 69.0), (5, 69.0),
+            (6, 13.8), (7, 13.8), (8, 18.0), (9, 13.8), (10, 13.8),
+            (11, 13.8), (12, 13.8), (13, 13.8), (14, 13.8),
+        ]
+
+        # (from, to, R_pu, X_pu, length_km)
+        line_data = [
+            (1,  2,  0.01938, 0.05917, 22.5),
+            (1,  5,  0.05403, 0.22304, 84.9),
+            (2,  3,  0.04699, 0.19797, 75.4),
+            (2,  4,  0.05811, 0.17632, 67.0),
+            (2,  5,  0.05695, 0.17388, 66.3),
+            (3,  4,  0.06701, 0.17103, 65.1),
+            (4,  5,  0.01335, 0.04211, 16.0),
+            (6,  11, 0.09498, 0.19890, 75.8),
+            (6,  12, 0.12291, 0.25581, 97.5),
+            (6,  13, 0.06615, 0.13027, 49.5),
+            (7,  9,  0.00000, 0.11001, 41.9),
+            (9,  10, 0.03181, 0.08450, 32.2),
+            (9,  14, 0.12711, 0.27038, 103.0),
+            (10, 11, 0.08205, 0.19207, 73.1),
+            (12, 13, 0.22092, 0.19988, 76.2),
+            (13, 14, 0.17093, 0.34802, 133.0),
+        ]
+
+        # (from, to, kv_hv, kv_lv, X_pu, tap, s_mva)
+        trafo_data = [
+            (4, 7,  69.0, 13.8, 0.20912, 0.978, 55.0),
+            (4, 9,  69.0, 13.8, 0.55618, 0.969, 32.0),
+            (5, 6,  69.0, 13.8, 0.25202, 0.932, 45.0),
+            (7, 8,  13.8, 18.0, 0.17615, 1.304, 32.0),
+        ]
+
+        # (bus_no, s_mva, v0_pu, bus_type, p_mw)
+        gen_data = [
+            (1,  615.0, 1.060, "slack",     0.0),
+            (2,   60.0, 1.045, "PV",       21.7),
+            (3,   60.0, 1.010, "sync_cond", 0.0),
+            (6,   25.0, 1.070, "sync_cond", 0.0),
+            (8,   25.0, 1.090, "sync_cond", 0.0),
+        ]
+
+        # (bus_no, p_mw, q_mvar)
+        load_data = [
+            (2,  21.7, 12.7), (3,  94.2, 19.0), (4,  47.8, -3.9),
+            (5,   7.6,  1.6), (6,  11.2,  7.5), (9,  29.5, 16.6),
+            (10,  9.0,  5.8), (11,  3.5,  1.8), (12,  6.1,  1.6),
+            (13, 13.5,  5.8), (14, 14.9,  5.0),
+        ]
+
+        shunt_data = [(9, 19.0)]  # (bus_no, q_mvar capacitive)
+
+        # ── Convert to sld_parser dataclasses ────────────────────
+        def _bn(n):
+            return f"Bus_{n}"
+
+        bus_kv = {n: kv for n, kv in bus_data}
+
+        buses = [sld_parser.Bus(loc_name=_bn(n), voltage_kv=kv, cx=0.0, cy=0.0)
+                 for n, kv in bus_data]
+
+        lines = []
+        for a, b, r_pu, x_pu, length in line_data:
+            z_base = (bus_kv[a] ** 2) / base_mva
+            length = length or 1.0
+            r_km = r_pu * z_base / length
+            x_km = x_pu * z_base / length
+            lines.append(sld_parser.Line(
+                loc_name=f"L{a}_{b}", bus1=_bn(a), bus2=_bn(b),
+                r_ohm=r_km, x_ohm=x_km, length_km=length,
+            ))
+
+        transformers = []
+        for a, b, kv_hv, kv_lv, x_pu, tap, s_mva in trafo_data:
+            hv, lv = (a, b) if kv_hv >= kv_lv else (b, a)
+            transformers.append(sld_parser.Transformer(
+                loc_name=f"T{a}_{b}", bus_hv=_bn(hv), bus_lv=_bn(lv),
+                s_mva=s_mva, x_pu=x_pu, tap_ratio=tap,
+                kv_hv=kv_hv, kv_lv=kv_lv,
+            ))
+
+        generators = [
+            sld_parser.Generator(
+                loc_name=f"G_{n}", bus=_bn(n),
+                p_mw=p_mw, s_mva=s_mva, v0_pu=v0, bus_type=bus_type,
+            )
+            for n, s_mva, v0, bus_type, p_mw in gen_data
+        ]
+
+        loads = [
+            sld_parser.Load(loc_name=f"Load_{n}", bus=_bn(n), p_mw=p, q_mvar=q)
+            for n, p, q in load_data
+        ]
+
+        shunts = [
+            sld_parser.Shunt(loc_name=f"Shunt_{n}", bus=_bn(n), q_mvar=q)
+            for n, q in shunt_data
+        ]
+
+        topology = {
+            "buses": buses, "lines": lines, "transformers": transformers,
+            "generators": generators, "loads": loads, "shunts": shunts,
+            "summary": {
+                "buses": len(buses), "lines": len(lines),
+                "transformers": len(transformers), "generators": len(generators),
+                "loads": len(loads), "shunts": len(shunts),
+                "source": "hardcoded",
+            },
+        }
+
+        global pf
+        if pf is None:
+            _ensure_powerfactory_on_path()
+            import powerfactory as pf
+
+        log.section("BUILD IEEE 14-BUS (HARDCODED DATASET)")
+        log.ok(f"Topology: {topology['summary']}")
+
+        # ── Acquire app + create fresh project ────────────────────
+        try:
+            if cls._shared_app is None:
+                app = pf.GetApplicationExt()
+                if app is None:
+                    raise RuntimeError("GetApplicationExt() returned None")
+                cls._apply_show_preference(app, open_digsilent)
+                cls._shared_app = app
+            else:
+                app = cls._shared_app
+                cls._apply_show_preference(app, open_digsilent)
+
+            cls._create_new_project(app, project_name)
+        except Exception as e:
+            log.error(f"Project creation failed: {e}")
+            return False, {"stage": "connect", "error": str(e),
+                           "summary": topology["summary"]}
+
+        # ── Build network ─────────────────────────────────────────
+        try:
+            import pf_network_builder
+            importlib.reload(pf_network_builder)
+            result = pf_network_builder.build_network(
+                app, topology, network_name, log=log,
+            )
+            report = {
+                "stage": "build",
+                "summary": topology["summary"],
+                "grid": result.get("grid"),
+                "created": result.get("created"),
+                "warnings": result.get("warnings", []),
+            }
+        except Exception as e:
+            log.error(f"Network build failed: {e}")
+            return False, {"stage": "build", "error": str(e),
+                           "summary": topology["summary"]}
+
+        # ── Load flow ─────────────────────────────────────────────
+        try:
+            ldf = app.GetFromStudyCase("ComLdf")
+            if ldf is None:
+                report["loadflow"] = {"converged": False,
+                                      "message": "ComLdf not found"}
+                return True, report
             err = ldf.Execute()
             converged = (err == 0)
             voltages = cls._collect_bus_voltages(app) if converged else {}
@@ -1105,12 +1522,12 @@ class DIgSILENTAgent:
                 "bus_voltages_pu": voltages,
             }
             if converged:
-                log.ok(f"Load flow converged. {len(voltages)} bus voltages collected.")
+                log.ok(f"Load flow converged. {len(voltages)} buses.")
             else:
-                log.warn(f"Load flow did NOT converge (ComLdf error code {err}).")
+                log.warn(f"Load flow did NOT converge (error {err}).")
             return True, report
         except Exception as e:
-            log.error(f"Load flow step failed: {e}")
+            log.error(f"Load flow failed: {e}")
             report["loadflow"] = {"converged": False, "message": str(e)}
             return True, report
 
@@ -1137,6 +1554,9 @@ class DIgSILENTAgent:
 
         log.section("DRAW SLD DIAGRAM")
 
+        import time as _time
+        _t_draw0 = _time.perf_counter()
+
         try:
             if cls._shared_app is None:
                 app = pf.GetApplicationExt()
@@ -1160,23 +1580,100 @@ class DIgSILENTAgent:
                 raise RuntimeError(f"Grid '{network_name}' not found in netdat")
             grid = grids[0]
 
-            # Get or create the layout command in the active study case.
-            layout = app.GetFromStudyCase("ComSgllayout")
+            # Activate the grid so PF knows which elements are relevant.
+            try:
+                grid.Activate()
+            except Exception as e:
+                log.warn(f"grid.Activate() failed (non-fatal): {e}")
+
+            sc = app.GetActiveStudyCase()
+            if sc is None:
+                raise RuntimeError("No active study case")
+
+            # Unfreeze the graphics board so the layout tool can add objects.
+            desktop = None
+            try:
+                desktop = app.GetFromStudyCase("SetDesktop")
+                if desktop is not None:
+                    try:
+                        desktop.Show()
+                    except Exception:
+                        pass
+                    desktop.Unfreeze()
+                    log.info("Unfroze graphics desktop")
+            except Exception as e:
+                log.warn(f"Could not unfreeze desktop (non-fatal): {e}")
+
+            # Remove any pre-existing network diagram for this grid so the
+            # Diagram Layout Tool generates a fresh one (avoids duplicates on
+            # re-run). The tool stores diagrams under Network Model\Diagrams.
+            prj = app.GetActiveProject()
+            try:
+                for old in (prj.GetContents(f"{network_name}.IntGrfnet", 1)
+                            or []):
+                    old.Delete()
+            except Exception as ex:
+                log.warn(f"Could not clear old IntGrfnet (non-fatal): {ex}")
+
+            # Run the Diagram Layout Tool. iAction=0 / iGenType=0 generates a
+            # complete new diagram and auto-arranges graphic symbols for the
+            # selected grid (pGrids). The tool creates the IntGrfnet itself.
+            #
+            # Use a FRESH command object: a persisted ComSgllayout retains a
+            # 'neighborStartElems' selection from previous runs that may point
+            # to deleted elements (dangling reference) and break Execute().
+            try:
+                for old in (sc.GetContents("*.ComSgllayout") or []):
+                    old.Delete()
+                for old in (sc.GetContents("*.SetSelect") or []):
+                    old.Delete()
+            except Exception as ex:
+                log.warn(f"Could not clear stale layout commands: {ex}")
+
+            layout = sc.CreateObject("ComSgllayout", "SLD Layout")
             if layout is None:
-                sc = app.GetActiveStudyCase()
-                if sc is None:
-                    raise RuntimeError("No active study case")
-                layout = sc.CreateObject("ComSgllayout", "SLD Layout")
-                if layout is None:
-                    raise RuntimeError("Could not create ComSgllayout object")
+                layout = app.GetFromStudyCase("ComSgllayout")
+            if layout is None:
+                raise RuntimeError("Could not obtain ComSgllayout command")
 
-            layout.SetAttribute("pGrid", grid)
+            for attr, val in (("iAction", 0), ("iGenType", 0)):
+                try:
+                    layout.SetAttribute(attr, val)
+                except Exception as ex:
+                    log.warn(f"ComSgllayout: could not set {attr}={val}: {ex}")
+            # Select the target grid. Without pGrids the tool aborts with
+            # "Diagram could not be generated, because no grid has been selected".
+            try:
+                layout.SetAttribute("pGrids", [grid])
+            except Exception:
+                try:
+                    layout.SetAttribute("pGrids", grid)
+                except Exception as ex:
+                    log.warn(f"ComSgllayout: could not set pGrids: {ex}")
+            log.info("ComSgllayout configured: iAction=0, iGenType=0, pGrids=grid")
+
             err = layout.Execute()
-            if err:
-                return False, f"ComSgllayout.Execute() returned error code {err}"
+            draw_s = round(_time.perf_counter() - _t_draw0, 3)
 
-            log.ok(f"ComSgllayout completed for grid '{network_name}'")
-            return True, f"SLD diagram drawn for grid '{network_name}'"
+            # The tool creates the IntGrfnet under Network Model\Diagrams during
+            # Execute. Count the placed graphic symbols (IntGrf) to confirm.
+            symbols = 0
+            try:
+                gnets = prj.GetContents(f"{network_name}.IntGrfnet", 1) or []
+                for gn in gnets:
+                    symbols += len(gn.GetContents("*.IntGrf", 1) or [])
+            except Exception:
+                pass
+
+            if err == 0 and symbols > 0:
+                log.ok(f"ComSgllayout completed for grid '{network_name}' "
+                       f"in {draw_s}s ({symbols} symbols)")
+                return True, (f"SLD diagram drawn for grid '{network_name}' "
+                              f"({symbols} symbols, draw_diagram_s={draw_s})")
+
+            return False, (
+                f"ComSgllayout finished (err={err}) but produced {symbols} "
+                f"symbols for grid '{network_name}'.")
 
         except Exception as e:
             log.error(f"draw_diagram failed: {e}")
@@ -1440,6 +1937,11 @@ class DIgSILENTAgent:
                 raise RuntimeError("ComLdf not found in study case")
             err = ldf.Execute()
             if err:
+                diagnostics = cls._diagnose_loadflow(app)
+                if diagnostics:
+                    detail = "; ".join(diagnostics)
+                    raise RuntimeError(
+                        f"ComLdf returned error code {err}. Likely causes: {detail}")
                 raise RuntimeError(f"ComLdf returned error code {err}")
 
             if save_csv:

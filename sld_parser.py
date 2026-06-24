@@ -157,6 +157,7 @@ class Line:
     r_ohm: float
     x_ohm: float
     length_km: float
+    b_us_per_km: float = 0.0  # positive-sequence shunt susceptance (µS/km)
 
 
 @dataclass
@@ -705,27 +706,32 @@ def apply_overrides(topology: dict, overrides_path: str) -> dict:
 # transformer ratings, and load/generator data. ``parse_sld`` tries this path
 # first and only falls back to geometry when no tables are found.
 
-# Section headers that delimit the datasheet tables (order matters).
+# Section headers that delimit the datasheet tables (order matters). Each entry
+# maps a section key to one or more candidate header strings (different IEEE
+# datasheets word them slightly differently).
 _TBL_SECTIONS = [
-    ("bus",   "Bus Data"),
-    ("gen",   "Generator / Synchronous Machine Data"),
-    ("trafo", "Transformer Data"),
-    ("line",  "Transmission Line Data"),
-    ("load",  "Load Data"),
-    ("end",   "Notes on data provenance"),
+    ("bus",   ("Bus Data",)),
+    ("gen",   ("Generator Data", "Generator / Synchronous Machine Data")),
+    ("trafo", ("Transformer Data",)),
+    ("line",  ("Transmission Line Data",)),
+    ("load",  ("Load Data",)),
+    ("end",   ("Notes on data provenance",)),
 ]
 
 # Row patterns (applied within their own section only).
 _BUS_ROW   = re.compile(r"^\s*(\d{1,3})\s+(\d+(?:\.\d+)?)\s*kV\b", re.MULTILINE)
-_GEN_ROW   = re.compile(
-    r"^\s*(\d{1,3})\s+(\d+(?:\.\d+)?)\s*kV\s+(\d+(?:\.\d+)?)\s+([\d.]+)\s+(.+)$",
-    re.MULTILINE)
+# Generator row: "Bus kV  <rest>" — the rest is tokenised because column layout
+# varies (14-bus: "MVA V0 Role"; 39-bus: "Pg Qg Qmin/Qmax Vg Role").
+_GEN_HEAD  = re.compile(r"^\s*(\d{1,3})\s+(\d+(?:\.\d+)?)\s*kV\s+(.+)$",
+                        re.MULTILINE)
 _TRAFO_ROW = re.compile(
     r"(\d{1,3})\s*-\s*(\d{1,3})\s+(\d+(?:\.\d+)?)\s*kV\s*/\s*(\d+(?:\.\d+)?)\s*kV"
     r"\s+([\d.]+)\s+([\d.]+)\s+(\d+(?:\.\d+)?)", re.MULTILINE)
+# Line row: "a-b R X B [MVA] [length]" — B is the total charging susceptance;
+# MVA (rating) and length are optional (39-bus omits length).
 _LINE_ROW  = re.compile(
-    r"(\d{1,3})\s*-\s*(\d{1,3})\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
-    r"\s+(\d+(?:\.\d+)?)\s+([\d.]+)", re.MULTILINE)
+    r"^\s*(\d{1,3})\s*-\s*(\d{1,3})\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
+    r"(?:\s+([\d.]+))?(?:\s+([\d.]+))?\s*$", re.MULTILINE)
 _LOAD_ROW  = re.compile(r"^\s*(\d{1,3})\s+(-?[\d.]+)\s+(-?[\d.]+)\s*$",
                         re.MULTILINE)
 _SHUNT_ROW = re.compile(r"^\s*(\d{1,3})\s*\(shunt\).*?\+?\s*(\d+(?:\.\d+)?)",
@@ -754,8 +760,12 @@ def _split_sections(text: str) -> Optional[dict]:
     """Locate each datasheet section by its header. Returns None if the core
     tables are absent (so the caller can fall back to geometry)."""
     idx: dict[str, int] = {}
-    for key, header in _TBL_SECTIONS:
-        pos = text.find(header)
+    for key, headers in _TBL_SECTIONS:
+        pos = -1
+        for h in headers:
+            p = text.find(h)
+            if p >= 0 and (pos < 0 or p < pos):
+                pos = p
         idx[key] = pos
     # Need at least the bus + line tables for a meaningful model.
     if idx["bus"] < 0 or idx["line"] < 0:
@@ -812,16 +822,46 @@ def parse_sld_tables(pdf_path: str,
 
     # -- Transmission lines (pu R/X on 100 MVA base -> ohms) ----------
     base_mva = 100.0
-    lines: list[Line] = []
+
+    # Collect raw line rows first so bus voltages can be reconciled before
+    # impedances are scaled by the (per-endpoint) base voltage.
+    raw_lines: list[tuple[int, int, float, float, float, float]] = []
     for m in _LINE_ROW.finditer(sections.get("line", "")):
         a, b = int(m.group(1)), int(m.group(2))
         r_pu, x_pu = float(m.group(3)), float(m.group(4))
-        length = float(m.group(7)) or cfg.default_line_length_km
-        z_base = (_kv(a) ** 2) / base_mva
+        b_pu = float(m.group(5)) if m.group(5) else 0.0  # total charging (pu)
+        length_raw = m.group(7)  # length column is optional
+        length = float(length_raw) if length_raw else cfg.default_line_length_km
+        raw_lines.append((a, b, r_pu, x_pu, b_pu, length))
+
+    # Enforce voltage consistency: a transmission line connects buses of the
+    # same nominal voltage. Some datasheets label tap-coupled buses at a lower
+    # class even though they are joined to the main grid by lines (PowerFactory
+    # then aborts load flow with "different voltage levels"). Propagate the
+    # higher voltage across every line-connected group until stable.
+    changed = True
+    while changed:
+        changed = False
+        for a, b, *_ in raw_lines:
+            va, vb = _kv(a), _kv(b)
+            if va != vb:
+                hv = max(va, vb)
+                bus_kv[a] = hv
+                bus_kv[b] = hv
+                changed = True
+
+    lines: list[Line] = []
+    for a, b, r_pu, x_pu, b_pu, length in raw_lines:
+        kv = _kv(a)
+        z_base = (kv ** 2) / base_mva
         r_tot, x_tot = r_pu * z_base, x_pu * z_base
+        # Total shunt susceptance B[S] = B_pu / Z_base; spread over the length so
+        # PowerFactory recovers the same total when it multiplies by dline.
+        b_tot_us = (b_pu / z_base) * 1e6  # microsiemens, whole line
         lines.append(Line(
             loc_name=f"L{a}_{b}", bus1=_bus_name(a), bus2=_bus_name(b),
             r_ohm=r_tot / length, x_ohm=x_tot / length, length_km=length,
+            b_us_per_km=b_tot_us / length,
         ))
 
     # -- Transformers -------------------------------------------------
@@ -835,23 +875,59 @@ def parse_sld_tables(pdf_path: str,
         # In "a-b kvA/kvB", kvA is bus a's winding, kvB is bus b's winding.
         bus_kv.setdefault(a, kv_a)
         bus_kv.setdefault(b, kv_b)
-        if kv_a >= kv_b:
-            hv, lv, kv_hv, kv_lv = a, b, kv_a, kv_b
+        # Winding voltages must match the (reconciled) bus nominal voltages so
+        # PowerFactory does not reject the transformer. When both ends share a
+        # voltage the unit degenerates to an in-phase tap branch.
+        va, vb = _kv(a), _kv(b)
+        if va >= vb:
+            hv, lv, kv_hv, kv_lv = a, b, va, vb
         else:
-            hv, lv, kv_hv, kv_lv = b, a, kv_b, kv_a
+            hv, lv, kv_hv, kv_lv = b, a, vb, va
         transformers.append(Transformer(
             loc_name=f"T{a}_{b}", bus_hv=_bus_name(hv), bus_lv=_bus_name(lv),
             s_mva=s_mva, x_pu=x_pu, tap_ratio=tap, kv_hv=kv_hv, kv_lv=kv_lv,
         ))
 
     # -- Generators / synchronous machines ----------------------------
+    # Two datasheet layouts are supported (detected per row):
+    #   * "Bus kV  MVA  V0  Role"                     (e.g. IEEE 14-bus)
+    #   * "Bus kV  Pg  Qg  Qmin/Qmax  Vg  Role"       (e.g. IEEE 39-bus)
     generators: list[Generator] = []
-    for m in _GEN_ROW.finditer(sections.get("gen", "")):
+    for m in _GEN_HEAD.finditer(sections.get("gen", "")):
         n = int(m.group(1))
-        s_mva = float(m.group(3))
-        v0 = float(m.group(4))
-        role = (m.group(5) or "").lower()
-        if "slack" in role:
+        rest = m.group(3).strip()
+        tokens = rest.split()
+        if not tokens:
+            continue
+
+        p_mw = 0.0
+        slash_idx = next((i for i, t in enumerate(tokens) if "/" in t), None)
+        if slash_idx is not None and slash_idx + 1 < len(tokens):
+            # 39-bus style: Pg Qg Qmin/Qmax Vg Role...
+            try:
+                p_mw = float(tokens[0])
+            except ValueError:
+                p_mw = 0.0
+            try:
+                v0 = float(tokens[slash_idx + 1])
+            except ValueError:
+                v0 = 1.0
+            role = " ".join(tokens[slash_idx + 2:]).lower()
+            # No explicit nameplate MVA -> size from Pg at 0.8 pf.
+            s_mva = round(max(p_mw / 0.8, 1.0), 1)
+        else:
+            # 14-bus style: MVA V0 Role...
+            try:
+                s_mva = float(tokens[0])
+            except ValueError:
+                s_mva = cfg.default_gen_mva
+            try:
+                v0 = float(tokens[1]) if len(tokens) > 1 else 1.0
+            except ValueError:
+                v0 = 1.0
+            role = " ".join(tokens[2:]).lower()
+
+        if "slack" in role or "swing" in role:
             bus_type = "slack"
         elif "sync" in role or "cond" in role:
             bus_type = "sync_cond"
@@ -859,8 +935,63 @@ def parse_sld_tables(pdf_path: str,
             bus_type = "PV"
         generators.append(Generator(
             loc_name=f"G_{n}", bus=_bus_name(n),
-            p_mw=0.0, s_mva=s_mva, v0_pu=v0, bus_type=bus_type,
+            p_mw=p_mw, s_mva=s_mva, v0_pu=v0, bus_type=bus_type,
         ))
+
+    # The PDF text extractor frequently breaks the generator *table* into
+    # columns, dropping the Pg dispatch and Role tokens (every machine then
+    # parses as P=0, which starves the network and breaks the load flow).
+    # Recover those values from the unambiguous one-line summaries that sit on
+    # the diagram, e.g. "Bus 30: Pg=250 MW, Qg=162 MVAr / Vg=1.050 pu (PV ...)".
+    # This only matches the "Pg="/"Vg=" prose, so datasheets without it (such as
+    # the IEEE 14-bus, whose generators carry no Pg) are left untouched.
+    pg_map = {int(m.group(1)): float(m.group(2))
+              for m in re.finditer(r"Bus\s+(\d+):\s*Pg\s*=\s*([\d.]+)\s*MW",
+                                   text, re.I)}
+    vg_role: dict[int, tuple] = {}
+    for m in re.finditer(
+            r"Bus\s+(\d+):[\s\S]{0,120}?Vg\s*=\s*([\d.]+)\s*pu\s*\(([^)\n]*)",
+            text, re.I):
+        vg_role.setdefault(int(m.group(1)),
+                           (float(m.group(2)), m.group(3).lower()))
+    for g in generators:
+        try:
+            n = int(g.bus.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        if n in pg_map:
+            g.p_mw = pg_map[n]
+            g.s_mva = round(max(g.p_mw / 0.8, g.s_mva, 1.0), 1)
+        if n in vg_role:
+            vg, role = vg_role[n]
+            g.v0_pu = vg
+            if "slack" in role or "swing" in role:
+                g.bus_type = "slack"
+            elif "sync" in role or "cond" in role:
+                g.bus_type = "sync_cond"
+            elif "pv" in role or "gen" in role:
+                g.bus_type = "PV"
+
+    # Robust slack resolution. The per-row "Role" token can be dropped when the
+    # PDF text extractor splits that column onto its own line, so also honour an
+    # explicit prose statement ("Bus 31 is the system slack/swing bus"). The
+    # designated machine wins and any other accidental slack is demoted to PV so
+    # the model keeps exactly one reference.
+    slack_bus = None
+    mslack = re.search(r"Bus\s+(\d+)\s+is\s+the\s+system\s+slack", text, re.I)
+    if mslack:
+        slack_bus = _bus_name(int(mslack.group(1)))
+    if slack_bus is None and not any(g.bus_type == "slack" for g in generators):
+        # fall back to a "(Slack)" tag sitting next to a bus number anywhere.
+        mtag = re.search(r"(?:Bus\s+)?(\d+)\b[^\n]*\bslack\b", text, re.I)
+        if mtag:
+            slack_bus = _bus_name(int(mtag.group(1)))
+    if slack_bus is not None and any(g.bus == slack_bus for g in generators):
+        for g in generators:
+            if g.bus == slack_bus:
+                g.bus_type = "slack"
+            elif g.bus_type == "slack":
+                g.bus_type = "PV"
 
     # -- Loads + shunt capacitors -------------------------------------
     loads: list[Load] = []

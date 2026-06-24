@@ -21,6 +21,7 @@ Tools
   read_results_csv  Read the latest (or a specific) RMS results CSV.
   build_network_from_sld  Parse a vector-PDF single-line diagram and build the
                           PowerFactory network (buses/lines/gens/loads/trafos).
+  build_ieee14bus   Build the hardcoded IEEE 14-bus test case in a new project.
   draw_sld          Auto-arrange the SLD for a grid via ComSgllayout.
 
 Usage
@@ -699,6 +700,41 @@ def build_network_from_sld(
         overrides_path,
         open_digsilent,
         project_name,
+    )
+    return _to_json({"success": ok, **report})
+
+
+@mcp.tool()
+def build_ieee14bus(
+    network_name: str = "IEEE_14_Bus",
+    project_name: str = "IEEE_14_Bus_Test",
+    open_digsilent: bool = True,
+) -> str:
+    """
+    Build the IEEE 14-bus standard test case in a fresh PowerFactory project.
+
+    No PDF is required. The complete dataset (14 buses, 16 lines, 4 transformers,
+    5 generators, 11 loads, 1 shunt capacitor) is hardcoded from the standard
+    100 MVA / 60 Hz benchmark. A new project is created (replacing any existing
+    one with the same name), all elements are commissioned with proper types
+    and V-setpoints, and a load flow is run. Use draw_sld afterwards to render
+    the diagram.
+
+    Parameters
+    ----------
+    network_name : str
+        Name of the ElmNet grid to create. Default "IEEE_14_Bus".
+    project_name : str
+        Name of the new PowerFactory project. Default "IEEE_14_Bus_Test".
+    open_digsilent : bool
+        If True (default), ensures the PowerFactory GUI window is visible.
+    """
+    _, DIgSILENTAgent = _load_modules()
+    ok, report = _pf(
+        DIgSILENTAgent.build_ieee14bus,
+        network_name,
+        project_name,
+        open_digsilent,
     )
     return _to_json({"success": ok, **report})
 
